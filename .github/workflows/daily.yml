@@ -95,11 +95,19 @@ jobs:
           git add excel/
           if git diff --cached --quiet; then
             echo "没有新增数据，跳过提交"
-          else
-            git commit -m "chore(excel): 更新股票日线 $(date +%F)"
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-            git push
+            exit 0
           fi
+          # xlsx 是二进制，两次运行撞车时 git 无法合并，rebase 会停在冲突中间，
+          # 接着 git push 就报 fatal（exit 128）。所以这里不做合并：
+          # 先把 HEAD 挪到远端最新（--soft 保留本次生成的文件），再把差异提交一次。
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --soft FETCH_HEAD
+          if git diff --cached --quiet; then
+            echo "本次结果与远端一致，无需提交"
+            exit 0
+          fi
+          git commit -m "chore(excel): 更新股票日线 $(date +%F)"
+          git push
 
       - name: 备份一份 Artifact
         if: always() && steps.gate.outputs.run == 'true'
