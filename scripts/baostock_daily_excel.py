@@ -4,7 +4,7 @@
 
 做什么：
 1. 用 Baostock（免费官方源）拉取指定股票的日线，只用近 N 天的增量；
-2. 与本地 Excel 里的历史行按 (日期, 股票代码) 去重后追加，重写整张表；
+2. 与本地 Excel 里的历史行按 (日期, 股票代码) 去重后追加，重写整张表（「股票」一列 = 代码 + 名称）；
 3. 涨跌额 / 涨跌幅 上色（涨红、跌绿、平灰）；
 4. 配置了 WECHAT_WEBHOOK_URL 时往企业微信群发摘要，配置了
    FEISHU_WEBHOOK_URL 时往飞书群发卡片，两个渠道可同时开。
@@ -36,8 +36,7 @@ from openpyxl.utils import get_column_letter
 
 HEADERS = [
     "日期",
-    "股票代码",
-    "股票名称",
+    "股票",
     "当日最低",
     "当日最高",
     "收盘",
@@ -45,6 +44,34 @@ HEADERS = [
     "涨跌幅(%)",
     "涨/跌",
 ]
+
+# 「股票」列是 代码 + 名称 合成的一列（如 "688981 中芯国际"）：
+# 这样筛选下拉里一个选项就是一只股票，选它等于同时按代码和名称筛，
+# 不用在代码列选一次、再去名称列选一次。行内部仍保留 股票代码 / 股票名称 两个字段。
+STOCK_COLUMN = "股票"
+
+
+def stock_label(code, name) -> str:
+    """688981 + 中芯国际 -> '688981 中芯国际'；名称为空时只留代码。"""
+    code_s = str(code or "").strip()
+    name_s = str(name or "").strip()
+    return f"{code_s} {name_s}".strip()
+
+
+def split_stock_label(label: str) -> tuple[str, str]:
+    """'688981 中芯国际' -> ('688981', '中芯国际')，兼容名称里带空格的情况。"""
+    parts = str(label or "").strip().split(None, 1)
+    code = parts[0] if parts else ""
+    name = parts[1] if len(parts) > 1 else ""
+    return code, name
+
+
+def excel_values(row: dict) -> list:
+    """把内部 row dict 摊成和 HEADERS 对齐的一行值。"""
+    return [
+        stock_label(row.get("股票代码"), row.get("股票名称")) if h == STOCK_COLUMN else row.get(h)
+        for h in HEADERS
+    ]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXCEL = str(REPO_ROOT / "excel" / "daily_stock.xlsx")
@@ -170,18 +197,26 @@ def fetch_daily(bs_code: str, start: str, end: str) -> list[dict]:
 
 
 def read_existing(path: Path) -> list[dict]:
-    """读已有 Excel；表头若变过则按列名映射，缺列留空。"""
+    """读已有 Excel；表头若变过则按列名映射，缺列留空。
+
+    兼容两种表头：新的「股票」合并列，和旧的「股票代码 + 股票名称」两列。
+    """
     if not path.exists():
         return []
     wb = load_workbook(path, data_only=True)
     ws = wb.active
     header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+    known = set(HEADERS) | {"股票代码", "股票名称"}
     rows: list[dict] = []
     for raw in ws.iter_rows(min_row=2, values_only=True):
         item: dict = {}
         for idx, name in enumerate(header):
-            if name in HEADERS and idx < len(raw):
+            if name in known and idx < len(raw):
                 item[name] = raw[idx]
+        if STOCK_COLUMN in item:                      # 新表头：拆回代码 + 名称
+            code, name = split_stock_label(item.pop(STOCK_COLUMN) or "")
+            item["股票代码"] = code
+            item["股票名称"] = item.get("股票名称") or name
         if not item.get("日期") or not item.get("股票代码"):
             continue
         item["日期"] = normalize_date(item["日期"])
@@ -213,12 +248,14 @@ def write_excel(path: Path, rows: list[dict]) -> None:
         cell.border = BORDER
         cell.alignment = Alignment(horizontal="center", vertical="center")
         ws.column_dimensions[get_column_letter(col_idx)].width = (
-            12 if name in ("日期", "股票代码", "股票名称", "涨/跌") else 11
+            20 if name == STOCK_COLUMN
+            else 12 if name in ("日期", "涨/跌")
+            else 11
         )
     ws.row_dimensions[1].height = 22
 
     for row in rows:
-        ws.append([row.get(h) for h in HEADERS])
+        ws.append(excel_values(row))
 
     for r in range(2, ws.max_row + 1):
         pct_cell = ws.cell(row=r, column=HEADERS.index("涨跌幅(%)") + 1)
@@ -243,7 +280,7 @@ def write_excel(path: Path, rows: list[dict]) -> None:
             cell.alignment = Alignment(horizontal="center")
 
         ws.cell(row=r, column=HEADERS.index("日期") + 1).alignment = Alignment(horizontal="center")
-        ws.cell(row=r, column=HEADERS.index("股票代码") + 1).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=HEADERS.index(STOCK_COLUMN) + 1).alignment = Alignment(horizontal="left")
         for col_name in ("当日最低", "当日最高", "收盘"):
             ws.cell(row=r, column=HEADERS.index(col_name) + 1).number_format = "0.00"
         ws.cell(row=r, column=HEADERS.index("涨跌额") + 1).number_format = "+0.00;-0.00;0.00"
@@ -253,7 +290,11 @@ def write_excel(path: Path, rows: list[dict]) -> None:
             ws.cell(row=r, column=col_idx).border = BORDER
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}{ws.max_row}"
+    # 筛选只给「日期 / 股票」两列（A:B）。Excel 会给 auto_filter.ref 覆盖到的每一列
+    # 都画下拉箭头，所以想让后面的数值列没有箭头，只能把 ref 收窄到 B 列；
+    # 收窄不影响筛选效果——筛出来的是整行，其余列照样跟着变。
+    filter_last = get_column_letter(HEADERS.index(STOCK_COLUMN) + 1)
+    ws.auto_filter.ref = f"A1:{filter_last}{ws.max_row}"
     wb.save(path)
 
 
@@ -263,10 +304,10 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=HEADERS, extrasaction="ignore")
-        writer.writeheader()
+        writer = csv.writer(f)
+        writer.writerow(HEADERS)
         for row in rows:
-            writer.writerow({h: row.get(h) for h in HEADERS})
+            writer.writerow(excel_values(row))
 
 
 def send_wechat(webhook: str, text: str) -> None:

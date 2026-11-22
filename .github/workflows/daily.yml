@@ -1,9 +1,14 @@
 name: 股票日线
 
-# UTC 12:00 = 北京时间 20:00（Baostock 通常 17:30 前后更新完当日行情）
+# 关于时间：GitHub 的 cron 是写死的字符串，不能用 Variables 拼，
+# 所以这里改成"每小时醒一次 + 自己判断要不要跑"：
+#   仓库变量 RUN_TIME（北京时间 HH:MM，默认 20:00）决定真正执行的那一次。
+# Baostock 通常 17:30 前后才更新完当日行情，别设太早。
+# 注意 cron 的 1-5 是 UTC 的周一到周五，对应北京时间 08:00~23:59 这段被覆盖；
+# 建议 RUN_TIME 设在 08:00 ~ 23:00 之间。
 on:
   schedule:
-    - cron: '0 12 * * 1-5'
+    - cron: '0 * * * 1-5'
   workflow_dispatch:
     inputs:
       days:
@@ -27,18 +32,52 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: 时间判断（北京时间，对照仓库变量 RUN_TIME）
+        id: gate
+        env:
+          TARGET: ${{ vars.RUN_TIME || '20:00' }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "手动触发，跳过时间判断，直接执行"
+            exit 0
+          fi
+          TARGET="${TARGET// /}"   # 容忍变量里多打空格
+          if ! [[ "$TARGET" =~ ^[0-2][0-9]:[0-5][0-9]$ ]]; then
+            echo "::error::变量 RUN_TIME='$TARGET' 格式不对，要写成 HH:MM，例如 20:00"
+            exit 1
+          fi
+          now_min=$((10#$(TZ=Asia/Shanghai date +%H) * 60 + 10#$(TZ=Asia/Shanghai date +%M)))
+          tgt_min=$((10#${TARGET%%:*} * 60 + 10#${TARGET##*:}))
+          diff=$((now_min - tgt_min))
+          echo "北京时间 $(TZ=Asia/Shanghai date '+%F %H:%M') ｜ 目标 $TARGET ｜ 相差 ${diff} 分钟"
+          # 每小时整点醒一次，所以窗口取 [0,60)：任意 HH:MM 都能覆盖，且一天只会命中一次。
+          # 窗口宽度也是延迟容忍度——GitHub 定时常晚 5~20 分钟，延迟超过 59 分钟才会漏跑。
+          if [ "$diff" -ge 0 ] && [ "$diff" -lt 60 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "在窗口内，开始执行"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "不在执行窗口内，跳过本次（这是正常现象，一小时醒一次）"
+          fi
+
       - name: 拉取仓库
+        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
 
       - name: 安装 Python
+        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 安装依赖
+        if: steps.gate.outputs.run == 'true'
         run: pip install --quiet -r requirements.txt
 
       - name: 抓取日线并写入 Excel
+        if: steps.gate.outputs.run == 'true'
         env:
           STOCK_LIST: ${{ github.event.inputs.stocks || vars.STOCK_LIST }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
@@ -49,6 +88,7 @@ jobs:
           python scripts/baostock_daily_excel.py --days "${{ github.event.inputs.days || '10' }}"
 
       - name: 提交回仓库（这就是"增量"的持久化）
+        if: steps.gate.outputs.run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -62,7 +102,7 @@ jobs:
           fi
 
       - name: 备份一份 Artifact
-        if: always()
+        if: always() && steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: daily-stock-excel
