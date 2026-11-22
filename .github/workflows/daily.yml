@@ -1,0 +1,71 @@
+name: 股票日线
+
+# UTC 12:00 = 北京时间 20:00（Baostock 通常 17:30 前后更新完当日行情）
+on:
+  schedule:
+    - cron: '0 12 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '回溯天数（增量会去重，多取几天没坏处）'
+        required: false
+        default: '10'
+      stocks:
+        description: '临时指定股票代码，逗号分隔（留空则用仓库 Variables 的 STOCK_LIST）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-excel
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install --quiet -r requirements.txt
+
+      - name: 抓取日线并写入 Excel
+        env:
+          STOCK_LIST: ${{ github.event.inputs.stocks || vars.STOCK_LIST }}
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          TZ: Asia/Shanghai
+          PYTHONIOENCODING: utf-8
+        run: |
+          python scripts/baostock_daily_excel.py --days "${{ github.event.inputs.days || '10' }}"
+
+      - name: 提交回仓库（这就是"增量"的持久化）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add excel/
+          if git diff --cached --quiet; then
+            echo "没有新增数据，跳过提交"
+          else
+            git commit -m "chore(excel): 更新股票日线 $(date +%F)"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
+
+      - name: 备份一份 Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-stock-excel
+          path: excel/
+          retention-days: 30
+          if-no-files-found: warn
