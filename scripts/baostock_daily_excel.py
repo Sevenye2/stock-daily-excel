@@ -341,15 +341,15 @@ def build_feishu_card(date_str: str, new_rows: list[dict], total: int, excel_pat
             pct = r["涨跌幅(%)"] or 0.0
             icon = "🔴" if pct > 0 else ("🟢" if pct < 0 else "⚪")
             change = r["涨跌额"]
-            change_s = f"{change:+.2f}" if isinstance(change, (int, float)) else "—"
+            change_s = f"{change:.2f}" if isinstance(change, (int, float)) else "—"
             elements.append(
                 {
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
                         "content": (
-                            f"{icon} **{r['股票代码']} {r['股票名称'] or ''}**　{r['收盘']:.2f}　{pct:+.2f}%　"
-                            f"高 {r['当日最高']:.2f} · 低 {r['当日最低']:.2f} · 涨跌 {change_s}"
+                            f"{icon} **{r['股票代码']} {r['股票名称'] or ''}**　涨跌 {pct:+.2f}%（{change_s}）　"
+                            f"高 {r['当日最高']:.2f} · 低 {r['当日最低']:.2f}　收盘 {r['收盘']:.2f}"
                         ),
                     },
                 }
