@@ -313,6 +313,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 def send_wechat(webhook: str, text: str) -> None:
     """企业微信群机器人：markdown 单条上限 4096 字节，超了直接截断。"""
     if not webhook:
+        print("[企业微信] 跳过：没有配置 WECHAT_WEBHOOK_URL")
         return
     payload_bytes = text.encode("utf-8")
     if len(payload_bytes) > 4000:
@@ -421,6 +422,7 @@ def build_feishu_card(date_str: str, new_rows: list[dict], total: int, excel_pat
 def send_feishu(webhook: str, payload: dict) -> None:
     """飞书群自定义机器人：卡片消息，失败只打印不抛异常。"""
     if not webhook:
+        print("[飞书] 跳过：没有配置 FEISHU_WEBHOOK_URL（GitHub 里检查 Settings → Secrets and variables → Actions → Secrets）")
         return
     try:
         import requests
