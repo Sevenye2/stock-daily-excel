@@ -26,7 +26,7 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import baostock as bs
@@ -75,6 +75,9 @@ def excel_values(row: dict) -> list:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXCEL = str(REPO_ROOT / "excel" / "daily_stock.xlsx")
+# 记录"最后一次成功跑的北京日期"，供 GitHub Action 判断今天是否已经跑过
+STATE_FILE = REPO_ROOT / "state" / "last_run.txt"
+CN_TZ = timezone(timedelta(hours=8))   # 北京时间；项目按北京日期组织数据
 
 # Baostock 日线字段：pctChg 是涨跌幅（%），preclose 是前收盘
 BAOSTOCK_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
@@ -434,6 +437,18 @@ def send_feishu(webhook: str, payload: dict) -> None:
         print(f"[飞书] 推送失败（不影响数据）: {exc}")
 
 
+def write_state(path: Path = STATE_FILE) -> str:
+    """记下本次成功运行的北京日期，Action 里靠它保证"一天只跑一次"。
+
+    必须显式转北京时间：GitHub runner 是 UTC，本地机器是 UTC+8，直接 now() 会串日期。
+    """
+    today = datetime.now(CN_TZ).strftime("%Y-%m-%d")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(today + "\n", encoding="utf-8")
+    print(f"[状态] 已记录本次运行日期 {today} → {path.relative_to(REPO_ROOT)}")
+    return today
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Baostock 日线增量导出 Excel")
     parser.add_argument("--stocks", default=os.getenv("STOCK_LIST", ""), help="逗号分隔的股票代码")
@@ -441,6 +456,7 @@ def main() -> int:
     parser.add_argument("--excel", default=os.getenv("EXCEL_PATH", DEFAULT_EXCEL), help="Excel 输出路径")
     parser.add_argument("--no-wechat", action="store_true", help="不推送企业微信")
     parser.add_argument("--no-feishu", action="store_true", help="不推送飞书")
+    parser.add_argument("--no-state", action="store_true", help="不记录运行日期（本地调试用）")
     args = parser.parse_args()
 
     codes = parse_stock_list(args.stocks)
@@ -513,6 +529,9 @@ def main() -> int:
             os.getenv("FEISHU_WEBHOOK_URL", "").strip(),
             build_feishu_card(date_str, new_rows, len(all_rows), excel_path),
         )
+
+    if not args.no_state:
+        write_state()
 
     return 0
 
