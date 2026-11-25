@@ -1,12 +1,14 @@
 name: 股票日线
 
-# 关于时间：GitHub 的 cron 是写死的字符串，不能用 Variables 拼；而且定时唤醒本身
-# 就不准时（实测晚 30~40 分钟很常见，偶尔整次丢掉）。所以这里不指望"准点醒"，
-# 改成"每 20 分钟醒一次 + 自己判断要不要跑"：
-#   RUN_TIME（仓库变量，北京时间 HH:MM，默认 19:00）之前 → 跳过
-#   今天已经跑过（state/last_run.txt 记着今天日期）→ 跳过
-#   其余情况 → 执行。哪怕晚了两三个小时，只要当天还没跑就会补上；跑完写标记，当天不再重复。
-# Baostock 通常 17:30 前后才更新完当日行情，别设太早；建议 08:00 ~ 22:00。
+# 关于时间：GitHub 的 cron 只是"到点往队列里丢一张票"，这张票可能排很久队，
+# 也可能被直接丢掉（官方文档原话：负载高时会延迟，负载足够高时部分排队任务会被丢弃）。
+# 实测这个仓库 47 小时里本该醒 40 次，实际只醒了 3 次，而且时间完全随机。
+#
+# 所以这里不跟它较劲：每 20 分钟醒一次，**每次醒了都跑**，靠去重保证幂等——
+#   · 已经有 (日期, 股票代码) 的数据会被跳过，所以跑一百次结果都一样
+#   · 只有真的抓到新数据才写文件、才提交、才推送
+# 效果：不管几点被叫醒，当天数据最迟在"下一次醒来"时补进表里，一天都不会缺。
+# 想调安静时段（几点前不推送），改进脚本里的 QUIET_UNTIL（默认 08:00）。
 on:
   schedule:
     - cron: '*/20 * * * 1-5'
@@ -33,70 +35,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      # gate 要读 state/last_run.txt，所以先拉仓库，再判断
       - name: 拉取仓库
         uses: actions/checkout@v7
 
-      - name: 时间判断（北京时间，对照仓库变量 RUN_TIME）
-        id: gate
-        env:
-          TARGET: ${{ vars.RUN_TIME || '19:00' }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "手动触发，跳过时间判断，直接执行"
-            exit 0
-          fi
-          TARGET="${TARGET// /}"   # 容忍变量里多打空格
-          if ! [[ "$TARGET" =~ ^[0-2][0-9]:[0-5][0-9]$ ]]; then
-            echo "::error::变量 RUN_TIME='$TARGET' 格式不对，要写成 HH:MM，例如 19:00"
-            exit 1
-          fi
-          TODAY=$(TZ=Asia/Shanghai date +%F)
-          NOW=$(TZ=Asia/Shanghai date +%H:%M)
-          if [ -f state/last_run.txt ] && [ "$(tr -d '[:space:]' < state/last_run.txt)" = "$TODAY" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "现在 $NOW：今天 $TODAY 已经跑过了（state/last_run.txt），跳过这次唤醒"
-            exit 0
-          fi
-          now_min=$((10#$(TZ=Asia/Shanghai date +%H) * 60 + 10#$(TZ=Asia/Shanghai date +%M)))
-          tgt_min=$((10#${TARGET%%:*} * 60 + 10#${TARGET##*:}))
-          if [ "$now_min" -lt "$tgt_min" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "现在 $NOW：还没到 $TARGET，跳过（每 20 分钟醒一次，到点后的那次会执行）"
-            exit 0
-          fi
-          echo "run=true" >> "$GITHUB_OUTPUT"
-          echo "现在 $NOW：已过 $TARGET 且今天还没跑过，开始执行（迟到多久都补，当天只跑一次）"
-
       - name: 安装 Python
-        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
       - name: 安装依赖
-        if: steps.gate.outputs.run == 'true'
         run: pip install --quiet -r requirements.txt
 
       - name: 抓取日线并写入 Excel
-        if: steps.gate.outputs.run == 'true'
         env:
           STOCK_LIST: ${{ github.event.inputs.stocks || vars.STOCK_LIST }}
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          QUIET_UNTIL: '08:00'
           TZ: Asia/Shanghai
           PYTHONIOENCODING: utf-8
         run: |
           python scripts/baostock_daily_excel.py --days "${{ github.event.inputs.days || '10' }}"
 
       - name: 提交回仓库（这就是"增量"的持久化）
-        if: steps.gate.outputs.run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add excel/ state/
+          git add excel/ data/ state/
           if git diff --cached --quiet; then
             echo "没有新增数据，跳过提交"
             exit 0
@@ -114,10 +79,12 @@ jobs:
           git push
 
       - name: 备份一份 Artifact
-        if: always() && steps.gate.outputs.run == 'true'
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: daily-stock-excel
-          path: excel/
+          path: |
+            excel/
+            data/
           retention-days: 30
           if-no-files-found: warn

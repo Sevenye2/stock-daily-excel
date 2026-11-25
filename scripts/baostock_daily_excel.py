@@ -3,26 +3,35 @@
 """Baostock 日线增量导出 Excel（可推送到企业微信 / 飞书群）。
 
 做什么：
-1. 用 Baostock（免费官方源）拉取指定股票的日线，只用近 N 天的增量；
-2. 与本地 Excel 里的历史行按 (日期, 股票代码) 去重后追加，重写整张表（「股票」一列 = 代码 + 名称）；
+1. 用 Baostock（免费官方源）拉取指定股票的日线，只取近 N 天的增量；
+2. 与历史数据按 (日期, 股票代码) 去重后追加。历史存在 data/daily.csv（长表，机器用），
+   Excel 是它的"宽表"视图：一行一个日期，每只股票占 7 列（代码/名称/最高/最低/收盘/涨跌额/涨跌幅），
+   股票之间用一条竖线隔开；
 3. 涨跌额 / 涨跌幅 上色（涨红、跌绿、平灰）；
-4. 配置了 WECHAT_WEBHOOK_URL 时往企业微信群发摘要，配置了
-   FEISHU_WEBHOOK_URL 时往飞书群发卡片，两个渠道可同时开。
+4. 有新数据时推送：配了 WECHAT_WEBHOOK_URL 发企业微信，配了 FEISHU_WEBHOOK_URL 发飞书卡片；
+   半夜（默认 00:00–08:00，北京时间的 QUIET_UNTIL）只写表不打扰，攒到白天第一次运行再补发。
+
+为什么这样设计：
+GitHub 的定时任务可能被延迟、甚至整次丢弃（官方文档明确"部分排队任务会被丢弃"），
+所以不跟它较劲——每次被唤醒都跑一次，靠"去重"保证幂等：有新数据就入库，没有就什么都不变。
 
 示例：
     python scripts/baostock_daily_excel.py --days 10
-    python scripts/baostock_daily_excel.py --stocks 300750,688256 --days 5 --no-wechat
+    python scripts/baostock_daily_excel.py --stocks 300750,688256 --days 5 --no-feishu
 
 环境变量：
     STOCK_LIST          逗号分隔的股票代码（--stocks 优先）
     WECHAT_WEBHOOK_URL  企业微信群机器人 webhook（可选）
     FEISHU_WEBHOOK_URL  飞书群自定义机器人 webhook（可选）
     EXCEL_PATH          输出路径，默认 excel/daily_stock.xlsx
+    QUIET_UNTIL         北京时间几点之前不推送，默认 08:00
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
 import sys
 import time
@@ -34,50 +43,38 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-HEADERS = [
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_EXCEL = str(REPO_ROOT / "excel" / "daily_stock.xlsx")
+# 长表（机器可读的真正数据源）：一行 = 一只股票的一天
+CANON_CSV = REPO_ROOT / "data" / "daily.csv"
+# 攒着没推送的日期（半夜不打扰，白天补发）
+PENDING_FILE = REPO_ROOT / "state" / "pending_notify.json"
+CN_TZ = timezone(timedelta(hours=8))   # 北京时间；项目按北京日期组织数据
+
+# 长表列（也是 CSV 的列顺序）
+CANON_HEADERS = [
     "日期",
-    "股票",
-    "当日最低",
+    "股票代码",
+    "股票名称",
     "当日最高",
+    "当日最低",
     "收盘",
     "涨跌额",
     "涨跌幅(%)",
-    "涨/跌",
 ]
 
-# 「股票」列是 代码 + 名称 合成的一列（如 "688981 中芯国际"）：
-# 这样筛选下拉里一个选项就是一只股票，选它等于同时按代码和名称筛，
-# 不用在代码列选一次、再去名称列选一次。行内部仍保留 股票代码 / 股票名称 两个字段。
-STOCK_COLUMN = "股票"
-
-
-def stock_label(code, name) -> str:
-    """688981 + 中芯国际 -> '688981 中芯国际'；名称为空时只留代码。"""
-    code_s = str(code or "").strip()
-    name_s = str(name or "").strip()
-    return f"{code_s} {name_s}".strip()
-
-
-def split_stock_label(label: str) -> tuple[str, str]:
-    """'688981 中芯国际' -> ('688981', '中芯国际')，兼容名称里带空格的情况。"""
-    parts = str(label or "").strip().split(None, 1)
-    code = parts[0] if parts else ""
-    name = parts[1] if len(parts) > 1 else ""
-    return code, name
-
-
-def excel_values(row: dict) -> list:
-    """把内部 row dict 摊成和 HEADERS 对齐的一行值。"""
-    return [
-        stock_label(row.get("股票代码"), row.get("股票名称")) if h == STOCK_COLUMN else row.get(h)
-        for h in HEADERS
-    ]
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EXCEL = str(REPO_ROOT / "excel" / "daily_stock.xlsx")
-# 记录"最后一次成功跑的北京日期"，供 GitHub Action 判断今天是否已经跑过
-STATE_FILE = REPO_ROOT / "state" / "last_run.txt"
-CN_TZ = timezone(timedelta(hours=8))   # 北京时间；项目按北京日期组织数据
+# 宽表里每只股票的字段顺序（用户指定：代码 名称 最高 最低 收盘 涨跌额 涨跌幅）
+FIELDS = ["代码", "名称", "最高", "最低", "收盘", "涨跌额", "涨跌幅"]
+FIELD_TO_KEY = {
+    "代码": "股票代码",
+    "名称": "股票名称",
+    "最高": "当日最高",
+    "最低": "当日最低",
+    "收盘": "收盘",
+    "涨跌额": "涨跌额",
+    "涨跌幅": "涨跌幅(%)",
+}
+NUMBER_KEYS = ("当日最高", "当日最低", "收盘", "涨跌额", "涨跌幅(%)")
 
 # Baostock 日线字段：pctChg 是涨跌幅（%），preclose 是前收盘
 BAOSTOCK_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,pctChg"
@@ -91,6 +88,7 @@ FLAT_FILL = "F2F2F2"
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
 HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+SEP_FILL = PatternFill("solid", fgColor="BFBFBF")
 THIN = Side(style="thin", color="D9D9D9")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
@@ -188,8 +186,8 @@ def fetch_daily(bs_code: str, start: str, end: str) -> list[dict]:
                 "日期": date_s,
                 "股票代码": bs_code.split(".")[-1],
                 "股票名称": "",
-                "当日最低": round(low_f, 2),
                 "当日最高": round(high_f, 2),
+                "当日最低": round(low_f, 2),
                 "收盘": round(close_f, 2),
                 "涨跌额": change,
                 "涨跌幅(%)": round(pct_f, 2),
@@ -199,118 +197,286 @@ def fetch_daily(bs_code: str, start: str, end: str) -> list[dict]:
     return rows
 
 
-def read_existing(path: Path) -> list[dict]:
-    """读已有 Excel；表头若变过则按列名映射，缺列留空。
-
-    兼容两种表头：新的「股票」合并列，和旧的「股票代码 + 股票名称」两列。
-    """
-    if not path.exists():
-        return []
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    header = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
-    known = set(HEADERS) | {"股票代码", "股票名称"}
-    rows: list[dict] = []
-    for raw in ws.iter_rows(min_row=2, values_only=True):
-        item: dict = {}
-        for idx, name in enumerate(header):
-            if name in known and idx < len(raw):
-                item[name] = raw[idx]
-        if STOCK_COLUMN in item:                      # 新表头：拆回代码 + 名称
-            code, name = split_stock_label(item.pop(STOCK_COLUMN) or "")
-            item["股票代码"] = code
-            item["股票名称"] = item.get("股票名称") or name
-        if not item.get("日期") or not item.get("股票代码"):
-            continue
-        item["日期"] = normalize_date(item["日期"])
-        item["股票代码"] = str(item["股票代码"]).zfill(6)
-        rows.append(item)
-    return rows
-
-
 def normalize_date(value) -> str:
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d")
     if hasattr(value, "strftime"):
         return value.strftime("%Y-%m-%d")
-    return str(value)[:10]
+    text = str(value).strip()
+    return text[:10]
 
 
-def write_excel(path: Path, rows: list[dict]) -> None:
-    """整表重写：保证排序、格式、配色一致。"""
+def to_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def clean_row(item: dict) -> dict | None:
+    """校验并规范化一条长表数据；缺日期或代码就丢弃。"""
+    date_s = normalize_date(item.get("日期") or "")
+    code = str(item.get("股票代码") or "").strip()
+    if not date_s or not code:
+        return None
+    code = code.split(".")[-1].zfill(6)
+    row = {
+        "日期": date_s,
+        "股票代码": code,
+        "股票名称": str(item.get("股票名称") or "").strip(),
+    }
+    for key in NUMBER_KEYS:
+        row[key] = to_float(item.get(key))
+    pct = row["涨跌幅(%)"]
+    row["涨/跌"] = "涨" if (pct or 0) > 0 else ("跌" if (pct or 0) < 0 else "平")
+    return row
+
+
+def read_canonical(path: Path = CANON_CSV) -> list[dict]:
+    """读长表 CSV（真正的数据源）。不存在就返回空列表。"""
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for item in csv.DictReader(f):
+            row = clean_row(item)
+            if row:
+                rows.append(row)
+    return rows
+
+
+def write_canonical(rows: list[dict], path: Path = CANON_CSV) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CANON_HEADERS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k) for k in CANON_HEADERS})
+
+
+def read_legacy_excel(path: Path) -> list[dict]:
+    """兼容老格式的老表：把 Excel 读成长表数据（用于一次性迁移）。
+
+    支持三种表头：
+      A. 「股票」合并列（9 列，代码+名称挤在一格）
+      B. 股票代码 / 股票名称 分开（8~9 列，长表）
+      C. 宽表（一行一个日期，每只股票 7 列）
+    """
+    if not path.exists():
+        return []
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+    first = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+    second = [str(c.value).strip() if c.value is not None else "" for c in ws[2]] if ws.max_row >= 2 else []
+
+    # C. 宽表：第 2 行是字段名
+    if "日期" not in first and "代码" in second:
+        return _read_wide(ws, first, second)
+
+    # A/B. 长表
+    header = first
+    rows: list[dict] = []
+    for raw in ws.iter_rows(min_row=2, values_only=True):
+        item: dict = {}
+        for idx, name in enumerate(header):
+            if idx < len(raw):
+                item[name] = raw[idx]
+        if "股票" in item:                       # A：拆回代码 + 名称
+            label = str(item.pop("股票") or "").strip()
+            parts = label.split(None, 1)
+            item["股票代码"] = parts[0] if parts else ""
+            item["股票名称"] = item.get("股票名称") or (parts[1] if len(parts) > 1 else "")
+        row = clean_row(item)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _read_wide(ws, first: list[str], second: list[str]) -> list[dict]:
+    """把宽表还原成长表数据。"""
+    rows: list[dict] = []
+    starts = [i for i, name in enumerate(second) if name == "代码"]
+    for raw in ws.iter_rows(min_row=3, values_only=True):
+        if not raw:
+            continue
+        date_s = normalize_date(raw[0] if raw else "")
+        if not date_s:
+            continue
+        for start in starts:
+            code = raw[start] if start < len(raw) else None
+            if not code:
+                continue
+            item = {"日期": date_s, "股票代码": code}
+            for offset, field in enumerate(FIELDS):
+                idx = start + offset
+                if field == "代码":
+                    continue
+                item[FIELD_TO_KEY[field]] = raw[idx] if idx < len(raw) else None
+            row = clean_row(item)
+            if row:
+                rows.append(row)
+    return rows
+
+
+def load_rows(excel_path: Path) -> list[dict]:
+    """优先读长表；没有长表就从老 Excel 迁移一次。"""
+    rows = read_canonical()
+    if rows:
+        return rows
+    rows = read_legacy_excel(excel_path)
+    if rows:
+        print(f"[迁移] 从 {excel_path.name} 读到 {len(rows)} 行，转存到 data/daily.csv")
+        write_canonical(rows)
+    return rows
+
+
+def write_excel(path: Path, rows: list[dict], codes: list[str]) -> None:
+    """宽表重写：一行一个日期，每只股票 7 列，股票之间一条竖线。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    names: dict[str, str] = {}
+    for row in rows:
+        if row.get("股票名称"):
+            names[row["股票代码"]] = row["股票名称"]
+    order = list(codes)
+    for code in sorted({r["股票代码"] for r in rows}):
+        if code not in order:
+            order.append(code)
+
+    dates = sorted({r["日期"] for r in rows}, reverse=True)
+    by_key = {(r["日期"], r["股票代码"]): r for r in rows}
+
     wb = Workbook()
     ws = wb.active
     ws.title = "日线数据"
 
-    ws.append(HEADERS)
-    for col_idx, name in enumerate(HEADERS, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.border = BORDER
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.column_dimensions[get_column_letter(col_idx)].width = (
-            20 if name == STOCK_COLUMN
-            else 12 if name in ("日期", "涨/跌")
-            else 11
+    # ---- 两行表头：第一行按股票分组，第二行是字段名 ----
+    ws.cell(row=1, column=1, value="日期")
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+
+    col = 2
+    sep_cols: list[int] = []
+    for i, code in enumerate(order):
+        start = col
+        label = f"{code} {names.get(code, '')}".strip()
+        ws.cell(row=1, column=start, value=label)
+        ws.merge_cells(
+            start_row=1, start_column=start, end_row=1, end_column=start + len(FIELDS) - 1
         )
-    ws.row_dimensions[1].height = 22
+        for j, field in enumerate(FIELDS):
+            ws.cell(row=2, column=start + j, value=field)
+        col = start + len(FIELDS)
+        if i < len(order) - 1:      # 股票之间插一条窄的竖线
+            ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
+            sep_cols.append(col)
+            col += 1
 
-    for row in rows:
-        ws.append(excel_values(row))
+    # ---- 表头样式 ----
+    for r in (1, 2):
+        for c in range(1, col):
+            cell = ws.cell(row=r, column=c)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.border = BORDER
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    for c in sep_cols:
+        for r in (1, 2):
+            ws.cell(row=r, column=c).fill = SEP_FILL
+    ws.row_dimensions[1].height = 20
+    ws.row_dimensions[2].height = 18
 
-    for r in range(2, ws.max_row + 1):
-        pct_cell = ws.cell(row=r, column=HEADERS.index("涨跌幅(%)") + 1)
-        pct = pct_cell.value
-        try:
-            pct_val = float(pct) if pct is not None else 0.0
-        except (TypeError, ValueError):
-            pct_val = 0.0
+    # ---- 列宽 ----
+    ws.column_dimensions["A"].width = 12
+    for i, _code in enumerate(order):
+        start = 2 + i * (len(FIELDS) + 1)
+        widths = [10, 13, 8, 8, 9, 8, 9]     # 代码 名称 最高 最低 收盘 涨跌额 涨跌幅
+        for j, width in enumerate(widths):
+            ws.column_dimensions[get_column_letter(start + j)].width = width
+    for c in sep_cols:
+        ws.column_dimensions[get_column_letter(c)].width = 2
 
-        if pct_val > 0:
-            font_color, fill_color = UP_COLOR, UP_FILL
-        elif pct_val < 0:
-            font_color, fill_color = DOWN_COLOR, DOWN_FILL
-        else:
-            font_color, fill_color = FLAT_COLOR, FLAT_FILL
+    # ---- 数据 ----
+    for r, date_s in enumerate(dates, start=3):
+        date_cell = ws.cell(row=r, column=1, value=date_s)
+        date_cell.alignment = Alignment(horizontal="center")
+        date_cell.border = BORDER
+        for i, code in enumerate(order):
+            start = 2 + i * (len(FIELDS) + 1)
+            item = by_key.get((date_s, code))
+            for j, field in enumerate(FIELDS):
+                key = FIELD_TO_KEY[field]
+                cell = ws.cell(row=r, column=start + j)
+                cell.value = item.get(key) if item else None
+                cell.border = BORDER
+                if field in ("代码", "名称"):
+                    cell.alignment = Alignment(horizontal="left" if field == "名称" else "center")
+                elif field in ("最高", "最低", "收盘"):
+                    cell.number_format = "0.00"
+                    cell.alignment = Alignment(horizontal="center")
+                elif field == "涨跌额":
+                    cell.number_format = "+0.00;-0.00;0.00"
+                    cell.alignment = Alignment(horizontal="center")
+                else:  # 涨跌幅
+                    cell.number_format = '+0.00"%";-0.00"%";0.00"%"'
+                    cell.alignment = Alignment(horizontal="center")
 
-        fill = PatternFill("solid", fgColor=fill_color)
-        for col_name in ("涨跌额", "涨跌幅(%)", "涨/跌"):
-            cell = ws.cell(row=r, column=HEADERS.index(col_name) + 1)
-            cell.font = Font(color=font_color, bold=col_name == "涨/跌")
-            cell.fill = fill
-            cell.alignment = Alignment(horizontal="center")
+            if not item:
+                continue
+            pct = item.get("涨跌幅(%)") or 0
+            if pct > 0:
+                font_color, fill_color = UP_COLOR, UP_FILL
+            elif pct < 0:
+                font_color, fill_color = DOWN_COLOR, DOWN_FILL
+            else:
+                font_color, fill_color = FLAT_COLOR, FLAT_FILL
+            fill = PatternFill("solid", fgColor=fill_color)
+            for field in ("涨跌额", "涨跌幅"):
+                cell = ws.cell(row=r, column=start + FIELDS.index(field))
+                cell.font = Font(color=font_color)
+                cell.fill = fill
 
-        ws.cell(row=r, column=HEADERS.index("日期") + 1).alignment = Alignment(horizontal="center")
-        ws.cell(row=r, column=HEADERS.index(STOCK_COLUMN) + 1).alignment = Alignment(horizontal="left")
-        for col_name in ("当日最低", "当日最高", "收盘"):
-            ws.cell(row=r, column=HEADERS.index(col_name) + 1).number_format = "0.00"
-        ws.cell(row=r, column=HEADERS.index("涨跌额") + 1).number_format = "+0.00;-0.00;0.00"
-        # 涨跌幅存的是 2.35 这种百分数，显示成 +2.35%
-        ws.cell(row=r, column=HEADERS.index("涨跌幅(%)") + 1).number_format = '+0.00"%";-0.00"%";0.00"%"'
-        for col_idx in range(1, len(HEADERS) + 1):
-            ws.cell(row=r, column=col_idx).border = BORDER
-
-    ws.freeze_panes = "A2"
-    # 筛选只给「日期 / 股票」两列（A:B）。Excel 会给 auto_filter.ref 覆盖到的每一列
-    # 都画下拉箭头，所以想让后面的数值列没有箭头，只能把 ref 收窄到 B 列；
-    # 收窄不影响筛选效果——筛出来的是整行，其余列照样跟着变。
-    filter_last = get_column_letter(HEADERS.index(STOCK_COLUMN) + 1)
-    ws.auto_filter.ref = f"A1:{filter_last}{ws.max_row}"
+    # 日期列冻结（滚到右边时始终能看到是哪天），表头两行也一起冻住
+    ws.freeze_panes = "B3"
     wb.save(path)
 
 
-def write_csv(path: Path, rows: list[dict]) -> None:
-    """同时导出一份 CSV：GitHub 网页上能直接点开看表格，不用下载 xlsx。"""
-    import csv
-
+def write_wide_csv(path: Path, rows: list[dict], codes: list[str]) -> None:
+    """和 Excel 同布局的 CSV：GitHub 网页上直接能看，不用下载。"""
     path.parent.mkdir(parents=True, exist_ok=True)
+    names: dict[str, str] = {}
+    for row in rows:
+        if row.get("股票名称"):
+            names[row["股票代码"]] = row["股票名称"]
+    order = list(codes)
+    for code in sorted({r["股票代码"] for r in rows}):
+        if code not in order:
+            order.append(code)
+
+    header: list[str] = ["日期"]
+    for code in order:
+        header.append(f"{code} {names.get(code, '')}".strip())
+        header.extend(FIELDS[1:])
+        header.append("|")              # 竖线占位符，和 Excel 里的分隔列对应
+    if len(order) > 1:
+        header = header[:-1]
+
+    by_key = {(r["日期"], r["股票代码"]): r for r in rows}
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(HEADERS)
-        for row in rows:
-            writer.writerow(excel_values(row))
+        writer.writerow(header)
+        for date_s in sorted({r["日期"] for r in rows}, reverse=True):
+            line: list = [date_s]
+            for i, code in enumerate(order):
+                item = by_key.get((date_s, code))
+                line.append(item.get("股票代码") if item else "")
+                for field in FIELDS[1:]:
+                    value = item.get(FIELD_TO_KEY[field]) if item else ""
+                    line.append("" if value is None else value)
+                if i < len(order) - 1:
+                    line.append("|")
+            writer.writerow(line)
 
 
 def send_wechat(webhook: str, text: str) -> None:
@@ -334,54 +500,48 @@ def send_wechat(webhook: str, text: str) -> None:
         print(f"[企业微信] 推送失败（不影响数据）: {exc}")
 
 
-def build_summary(date_str: str, new_rows: list[dict], total: int, excel_path: Path) -> str:
-    ups = [r for r in new_rows if r["涨/跌"] == "涨"]
-    downs = [r for r in new_rows if r["涨/跌"] == "跌"]
-    flats = [r for r in new_rows if r["涨/跌"] == "平"]
+def build_summary(date_str: str, rows: list[dict], total: int, excel_path: Path) -> str:
+    ups = [r for r in rows if r["涨/跌"] == "涨"]
+    downs = [r for r in rows if r["涨/跌"] == "跌"]
+    flats = [r for r in rows if r["涨/跌"] == "平"]
 
     lines = [
         f"## 股票日线更新 {date_str}",
-        f"> 新增 **{len(new_rows)}** 行 ｜ 表内共 **{total}** 行",
+        f"> 本次 **{len(rows)}** 只 ｜ 表内共 **{total}** 行",
         f"> 涨 {len(ups)} ｜ 跌 {len(downs)} ｜ 平 {len(flats)}",
     ]
-    if new_rows:
-        top_up = sorted([r for r in new_rows if r["涨跌幅(%)"] is not None], key=lambda x: x["涨跌幅(%)"], reverse=True)[:3]
-        top_down = sorted([r for r in new_rows if r["涨跌幅(%)"] is not None], key=lambda x: x["涨跌幅(%)"])[:3]
-        if top_up and top_up[0]["涨跌幅(%)"] > 0:
+    if rows:
+        ordered = sorted(rows, key=lambda x: x["涨跌幅(%)"] or 0, reverse=True)
+        top_up = [r for r in ordered if (r["涨跌幅(%)"] or 0) > 0][:3]
+        top_down = [r for r in ordered[::-1] if (r["涨跌幅(%)"] or 0) < 0][:3]
+        if top_up:
             lines.append("**涨幅前三**")
             for r in top_up:
-                if r["涨跌幅(%)"] <= 0:
-                    break
-                lines.append(f"- {r['股票代码']} {r['股票名称'] or ''} {r['涨跌幅(%)']:+.2f}%（{r['涨跌额']:+.2f}）")
-        if top_down and top_down[0]["涨跌幅(%)"] < 0:
+                lines.append(f"- {r['股票代码']} {r['股票名称']} {r['涨跌幅(%)']:+.2f}%（{r['涨跌额']:+.2f}）")
+        if top_down:
             lines.append("**跌幅前三**")
             for r in top_down:
-                if r["涨跌幅(%)"] >= 0:
-                    break
-                lines.append(f"- {r['股票代码']} {r['股票名称'] or ''} {r['涨跌幅(%)']:+.2f}%（{r['涨跌额']:+.2f}）")
+                lines.append(f"- {r['股票代码']} {r['股票名称']} {r['涨跌幅(%)']:+.2f}%（{r['涨跌额']:+.2f}）")
     else:
-        lines.append("今日没有新数据（非交易日，或 Baostock 尚未更新当日行情）。")
+        lines.append("本次没有新数据（非交易日，或 Baostock 尚未更新当日行情）。")
 
     lines.append(f"<font color=\"comment\">文件：{excel_path.name}</font>")
     return "\n".join(lines)
 
 
-def build_feishu_card(date_str: str, new_rows: list[dict], total: int, excel_path: Path) -> dict:
+def build_feishu_card(date_str: str, rows: list[dict], total: int, excel_path: Path) -> dict:
     """飞书群机器人卡片：一只股票一行，字段与 Excel 保持一致。"""
-    ups = [r for r in new_rows if r["涨/跌"] == "涨"]
-    downs = [r for r in new_rows if r["涨/跌"] == "跌"]
-    flats = [r for r in new_rows if r["涨/跌"] == "平"]
+    ups = [r for r in rows if r["涨/跌"] == "涨"]
+    downs = [r for r in rows if r["涨/跌"] == "跌"]
+    flats = [r for r in rows if r["涨/跌"] == "平"]
 
     elements: list[dict] = []
-    if new_rows:
-        head = f"**{len(new_rows)} 只 ｜ 涨 {len(ups)} · 跌 {len(downs)} · 平 {len(flats)}**\n表内累计 **{total}** 行"
-    else:
-        head = f"**今日无新增**（非交易日，或 Baostock 尚未更新）\n最近数据日 {date_str} ｜ 表内累计 **{total}** 行"
+    head = f"**{len(rows)} 只 ｜ 涨 {len(ups)} · 跌 {len(downs)} · 平 {len(flats)}**\n表内累计 **{total}** 行"
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": head}})
     elements.append({"tag": "hr"})
 
-    if new_rows:
-        ordered = sorted(new_rows, key=lambda r: r["涨跌幅(%)"] if r["涨跌幅(%)"] is not None else 0, reverse=True)
+    if rows:
+        ordered = sorted(rows, key=lambda r: r["涨跌幅(%)"] if r["涨跌幅(%)"] is not None else 0, reverse=True)
         for r in ordered:
             pct = r["涨跌幅(%)"] or 0.0
             icon = "🔴" if pct > 0 else ("🟢" if pct < 0 else "⚪")
@@ -437,16 +597,45 @@ def send_feishu(webhook: str, payload: dict) -> None:
         print(f"[飞书] 推送失败（不影响数据）: {exc}")
 
 
-def write_state(path: Path = STATE_FILE) -> str:
-    """记下本次成功运行的北京日期，Action 里靠它保证"一天只跑一次"。
+def load_pending(path: Path = PENDING_FILE) -> list[str]:
+    """读取攒着没推送的日期。"""
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [str(d) for d in data.get("dates", [])]
+    except (OSError, ValueError):
+        return []
 
-    必须显式转北京时间：GitHub runner 是 UTC，本地机器是 UTC+8，直接 now() 会串日期。
-    """
-    today = datetime.now(CN_TZ).strftime("%Y-%m-%d")
+
+def save_pending(dates: list[str], path: Path = PENDING_FILE) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(today + "\n", encoding="utf-8")
-    print(f"[状态] 已记录本次运行日期 {today} → {path.relative_to(REPO_ROOT)}")
-    return today
+    if not dates:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(json.dumps({"dates": sorted(set(dates))}, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def quiet_until_hour(raw: str) -> int:
+    """'08:00' -> 8；格式不对就退回 8。"""
+    try:
+        return int(str(raw).strip().split(":")[0])
+    except (TypeError, ValueError, IndexError):
+        return 8
+
+
+def is_wide_excel(path: Path) -> bool:
+    """现有 xlsx 是不是新的宽表布局（第二行是 代码/名称/最高...）。"""
+    if not path.exists():
+        return False
+    try:
+        wb = load_workbook(path, read_only=True)
+        ws = wb.active
+        row2 = [c.value for c in next(ws.iter_rows(min_row=2, max_row=2), [])]
+        wb.close()
+        return "代码" in row2 and "涨跌幅" in row2
+    except Exception:  # noqa: BLE001 - 读不了就当需要重写
+        return False
 
 
 def main() -> int:
@@ -456,7 +645,8 @@ def main() -> int:
     parser.add_argument("--excel", default=os.getenv("EXCEL_PATH", DEFAULT_EXCEL), help="Excel 输出路径")
     parser.add_argument("--no-wechat", action="store_true", help="不推送企业微信")
     parser.add_argument("--no-feishu", action="store_true", help="不推送飞书")
-    parser.add_argument("--no-state", action="store_true", help="不记录运行日期（本地调试用）")
+    parser.add_argument("--notify-empty", action="store_true", help="本次没有新数据也推送（本地测试用）")
+    parser.add_argument("--force-notify", action="store_true", help="忽略安静时段，立即推送")
     args = parser.parse_args()
 
     codes = parse_stock_list(args.stocks)
@@ -471,7 +661,7 @@ def main() -> int:
     print(f"[配置] 股票 {len(codes)} 只: {','.join(codes)}")
     print(f"[配置] 日期范围 {start_date} ~ {end_date}，Excel: {excel_path}")
 
-    existing = read_existing(excel_path)
+    existing = load_rows(excel_path)
     seen = {(r["日期"], r["股票代码"]) for r in existing}
     print(f"[增量] 已有 {len(existing)} 行")
 
@@ -510,28 +700,53 @@ def main() -> int:
 
     all_rows = existing + new_rows
     all_rows.sort(key=lambda r: (str(r["日期"]), str(r["股票代码"])), reverse=True)
-    write_excel(excel_path, all_rows)
-    write_csv(excel_path.with_suffix(".csv"), all_rows)
-    print(f"[写出] {excel_path} 共 {len(all_rows)} 行（本次新增 {len(new_rows)}）")
 
-    # 没有新增行时（周末/节假日），标题里的日期回退到表内最近的数据日，避免显示成"今天"
-    date_str = max((r["日期"] for r in new_rows), default="") or max(
-        (r["日期"] for r in all_rows), default=end_date
-    )
-    summary = build_summary(date_str, new_rows, len(all_rows), excel_path)
-    print("\n" + summary + "\n")
+    # 有新数据就重写；没新数据但表还是老布局（或文件不存在）时也重写一次，
+    # 这样改表结构后不需要手动补跑。
+    if new_rows or not is_wide_excel(excel_path):
+        write_canonical(all_rows)
+        write_excel(excel_path, all_rows, codes)
+        write_wide_csv(excel_path.with_suffix(".csv"), all_rows, codes)
+        print(f"[写出] {excel_path} 共 {len(all_rows)} 行（本次新增 {len(new_rows)}）")
+    else:
+        print("[写出] 没有新增数据，跳过重写（避免无意义的提交）")
 
-    if not args.no_wechat:
-        send_wechat(os.getenv("WECHAT_WEBHOOK_URL", "").strip(), summary)
+    # ---- 推送：只在有新数据时打扰；半夜先攒着，白天补发 ----
+    pending = load_pending()
+    new_dates = sorted({r["日期"] for r in new_rows})
+    if new_dates:
+        pending = sorted(set(pending) | set(new_dates))
 
-    if not args.no_feishu:
-        send_feishu(
-            os.getenv("FEISHU_WEBHOOK_URL", "").strip(),
-            build_feishu_card(date_str, new_rows, len(all_rows), excel_path),
-        )
+    notify_rows: list[dict] = []
+    if pending:
+        wanted = set(pending)
+        notify_rows = [r for r in all_rows if r["日期"] in wanted]
 
-    if not args.no_state:
-        write_state()
+    hour = datetime.now(CN_TZ).hour
+    limit = quiet_until_hour(os.getenv("QUIET_UNTIL", "08:00"))
+    quiet = hour < limit and not args.force_notify
+
+    should_notify = bool(notify_rows) or args.notify_empty
+    if quiet and should_notify:
+        save_pending(pending)
+        print(f"[推送] 现在北京时间 {hour} 点，属于安静时段（{limit} 点前不打扰），{len(pending)} 个日期攒着白天再发")
+        should_notify = False
+
+    if should_notify:
+        date_str = max(pending, default="") or max((r["日期"] for r in all_rows), default=end_date)
+        summary = build_summary(date_str, notify_rows, len(all_rows), excel_path)
+        print("\n" + summary + "\n")
+        if not args.no_wechat:
+            send_wechat(os.getenv("WECHAT_WEBHOOK_URL", "").strip(), summary)
+        if not args.no_feishu:
+            send_feishu(
+                os.getenv("FEISHU_WEBHOOK_URL", "").strip(),
+                build_feishu_card(date_str, notify_rows, len(all_rows), excel_path),
+            )
+        save_pending([])
+    else:
+        if not notify_rows:
+            print("[推送] 没有新数据，不推送")
 
     return 0
 
