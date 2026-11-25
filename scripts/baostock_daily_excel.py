@@ -345,7 +345,7 @@ def write_excel(path: Path, rows: list[dict], codes: list[str]) -> None:
         if code not in order:
             order.append(code)
 
-    dates = sorted({r["日期"] for r in rows}, reverse=True)
+    dates = sorted({r["日期"] for r in rows})
     by_key = {(r["日期"], r["股票代码"]): r for r in rows}
 
     wb = Workbook()
@@ -466,7 +466,7 @@ def write_wide_csv(path: Path, rows: list[dict], codes: list[str]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        for date_s in sorted({r["日期"] for r in rows}, reverse=True):
+        for date_s in sorted({r["日期"] for r in rows}):
             line: list = [date_s]
             for i, code in enumerate(order):
                 item = by_key.get((date_s, code))
@@ -647,6 +647,7 @@ def main() -> int:
     parser.add_argument("--no-feishu", action="store_true", help="不推送飞书")
     parser.add_argument("--notify-empty", action="store_true", help="本次没有新数据也推送（本地测试用）")
     parser.add_argument("--force-notify", action="store_true", help="忽略安静时段，立即推送")
+    parser.add_argument("--rebuild", action="store_true", help="没有新数据也按当前布局重画表格（改样式后用）")
     args = parser.parse_args()
 
     codes = parse_stock_list(args.stocks)
@@ -699,11 +700,11 @@ def main() -> int:
         bs.logout()
 
     all_rows = existing + new_rows
-    all_rows.sort(key=lambda r: (str(r["日期"]), str(r["股票代码"])), reverse=True)
+    all_rows.sort(key=lambda r: (str(r["日期"]), str(r["股票代码"])))
 
     # 有新数据就重写；没新数据但表还是老布局（或文件不存在）时也重写一次，
     # 这样改表结构后不需要手动补跑。
-    if new_rows or not is_wide_excel(excel_path):
+    if new_rows or args.rebuild or not is_wide_excel(excel_path):
         write_canonical(all_rows)
         write_excel(excel_path, all_rows, codes)
         write_wide_csv(excel_path.with_suffix(".csv"), all_rows, codes)
