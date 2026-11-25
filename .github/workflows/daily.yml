@@ -62,20 +62,27 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add excel/ data/ state/
-          if git diff --cached --quiet; then
+          if git diff --cached --quiet -- excel data state; then
             echo "没有新增数据，跳过提交"
             exit 0
           fi
-          # xlsx 是二进制，两次运行撞车时 git 无法合并，rebase 会停在冲突中间，
-          # 接着 git push 就报 fatal（exit 128）。所以这里不做合并：
-          # 先把 HEAD 挪到远端最新（--soft 保留本次生成的文件），再把差异提交一次。
+          # 两个坑，都在这里绕开：
+          # 1) 提交里绝对不能带上 .github/workflows/* 的改动，否则会报
+          #    "refusing to allow a GitHub App to create or update workflow ...
+          #    without `workflows` permission"，GITHUB_TOKEN 永远拿不到这个权限。
+          #    → 提交时显式限定路径：git commit ... -- excel data state
+          # 2) xlsx 是二进制，两次运行撞车时 rebase 会停在冲突中间，接着 push 报
+          #    fatal（exit 128）。→ 不做合并，改成"远端最新当基线，只叠本次数据"：
+          #    --mixed 让 index 回到远端（工作区里本次生成的文件不动），
+          #    再重新 add 这三个目录，提交自然只包含数据。
           git fetch origin "${GITHUB_REF_NAME}"
-          git reset --soft FETCH_HEAD
-          if git diff --cached --quiet; then
+          git reset --mixed FETCH_HEAD
+          git add excel/ data/ state/
+          if git diff --cached --quiet -- excel data state; then
             echo "本次结果与远端一致，无需提交"
             exit 0
           fi
-          git commit -m "chore(excel): 更新股票日线 $(date +%F)"
+          git commit -m "chore(excel): 更新股票日线 $(date +%F)" -- excel data state
           git push
 
       - name: 备份一份 Artifact
